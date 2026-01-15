@@ -1,0 +1,50 @@
+version: 2
+
+project_name: tfui
+
+builds:
+  - main: ./cmd/tfui
+    binary: tfui
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+homebrew_casks:
+  - repository:
+      owner: SayYoungMan
+      name: homebrew-tap
+      token: "{{ .Env.GORELEASER_TOKEN }}"
+    homepage: https://github.com/SayYoungMan/tfui
+    description: Interactive terminal UI for Terraform plan/apply workflows
+    license: MIT
+
+scoops:
+  - repository:
+      owner: SayYoungMan
+      name: scoop-bucket
+      token: "{{ .Env.GORELEASER_TOKEN }}"
+    homepage: https://github.com/SayYoungMan/tfui
+    description: Interactive terminal UI for Terraform plan/apply workflows
+    license: MIT
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

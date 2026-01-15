@@ -1,0 +1,458 @@
+package ui
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/SayYoungMan/tfui/pkg/terraform"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRenderListView_ShowsResources(t *testing.T) {
+	m := newTestModel()
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "+ aws_s3_bucket.a")
+	assert.Contains(t, view.Content, "~ aws_s3_bucket.b (drift)")
+	assert.Contains(t, view.Content, "- aws_iam_role.c (delete_because_no_resource_config)")
+	assert.Contains(t, view.Content, "+/- aws_db_instance.d (cannot_update)")
+	assert.Contains(t, view.Content, "↓ aws_s3_bucket.c")
+	assert.Contains(t, view.Content, "data.aws_region.current")
+	assert.Contains(t, view.Content, "aws_vpc.main")
+
+	// Check for ANSI string for color
+	for _, r := range m.resources {
+		for line := range strings.SplitSeq(view.Content, "\n") {
+			if strings.Contains(line, r.Address) {
+				if !isUnchanged(r) {
+					assert.Contains(t, line, actionAnsiString(r.Action))
+				}
+			}
+		}
+	}
+}
+
+func TestRenderListView_ShowsCursor(t *testing.T) {
+	m := newTestModel()
+	m.cursor = 1
+
+	view := m.View()
+	lines := strings.Split(view.Content, "\n")
+	var lineA, lineB string
+	for _, line := range lines {
+		if strings.Contains(line, testResources[0].Address) {
+			lineA = line
+		}
+		if strings.Contains(line, testResources[1].Address) {
+			lineB = line
+		}
+	}
+
+	assert.NotContains(t, lineA, cursorAnsiString)
+	assert.Contains(t, lineB, cursorAnsiString)
+}
+
+func TestRenderListView_ShowsSelected(t *testing.T) {
+	m := newTestModel()
+	m.selected = map[string]bool{testResources[1].Address: true}
+
+	view := m.View()
+	for line := range strings.SplitSeq(view.Content, "\n") {
+		if strings.Contains(line, testResources[1].Address) {
+			assert.Contains(t, line, ansiString)
+		}
+	}
+}
+
+func TestRenderListView_SelectAllShowsAllSelected(t *testing.T) {
+	m := newTestModel()
+	m.selectAll = true
+
+	view := m.View()
+
+	for line := range strings.SplitSeq(view.Content, "\n") {
+		for _, r := range testResources {
+			if strings.Contains(line, r.Address) {
+				assert.Contains(t, line, ansiString)
+			}
+		}
+	}
+}
+
+func TestRenderListView_OnlyRendersVisibleSlice(t *testing.T) {
+	var resources []*terraform.Resource
+	for i := range 5 {
+		resources = append(resources, &terraform.Resource{
+			Address: fmt.Sprintf("aws_s3_bucket.bucket_%d", i),
+			Action:  terraform.ActionNoop,
+		})
+	}
+	m := newTestModelWithResources(resources)
+	m.viewHeight = 3 + m.getReservedRows()
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "aws_s3_bucket.bucket_0")
+	assert.Contains(t, view.Content, "aws_s3_bucket.bucket_1")
+	assert.Contains(t, view.Content, "aws_s3_bucket.bucket_2")
+
+	assert.NotContains(t, view.Content, "aws_s3_bucket.bucket_3")
+	assert.NotContains(t, view.Content, "aws_s3_bucket.bucket_4")
+}
+
+func TestRenderListView_ViewShowsScanning(t *testing.T) {
+	m := newTestModel()
+
+	m.workState = workStatePull
+	view := m.View()
+	require.Contains(t, view.Content, "Scanning...")
+
+	m.workState = workPlan
+	view = m.View()
+	require.Contains(t, view.Content, "Scanning...")
+	require.Contains(t, view.Content, fmt.Sprintf("(%d/%d resources scanned)", len(m.resources), len(m.resources)))
+
+	m.workState = workShowPlan
+	view = m.View()
+	assert.Contains(t, view.Content, "Fetching diffs...")
+	assert.Contains(t, view.Content, fmt.Sprintf("%d resources scanned", len(m.resources)))
+
+	m.workState = workIdle
+	view = m.View()
+	assert.Contains(t, view.Content, "Scan Complete")
+	assert.Contains(t, view.Content, fmt.Sprintf("%d resources scanned", len(m.resources)))
+	assert.NotContains(t, view.Content, "Scanning...")
+}
+
+func TestRenderListView_ViewShowsSelectedCount(t *testing.T) {
+	m := newTestModel()
+	m.selected = map[string]bool{testResources[0].Address: true}
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "1 selected")
+}
+
+func TestRenderListView_ViewShowsAllSelected(t *testing.T) {
+	m := newTestModel()
+	m.selectAll = true
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "ALL selected")
+}
+
+func TestRenderListView_ViewShowsFilterCount(t *testing.T) {
+	m := newTestModel()
+	m.filterInput.SetValue("iam")
+	m.rebuildRows()
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "showing 1")
+	assert.Contains(t, view.Content, fmt.Sprintf("%d resources scanned", len(testResources)))
+}
+
+func TestRenderListView_ShowsWarningCount(t *testing.T) {
+	m := newTestModel()
+	m.workState = workIdle
+	m.diagnostics = []terraform.Diagnostic{
+		{Severity: "warning", Summary: "Deprecated"},
+		{Severity: "warning", Summary: "Also deprecated"},
+	}
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "2 warnings")
+}
+
+func TestRenderListView_ShowsHideUnchangedInfo(t *testing.T) {
+	m := newTestModel()
+
+	require.Contains(t, m.View().Content, "hide unchanged")
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'H'})
+	m = newModel.(Model)
+
+	assert.Contains(t, m.View().Content, "show unchanged")
+}
+
+func TestRenderActionPickerView_ShowsActionPicker(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewActionPicker
+	m.selected = map[string]bool{testResources[0].Address: true, testResources[1].Address: true}
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "2 resource(s) selected")
+	assert.Contains(t, view.Content, "plan")
+	assert.Contains(t, view.Content, "apply")
+	assert.Contains(t, view.Content, "destroy")
+	assert.Contains(t, view.Content, "taint")
+	assert.Contains(t, view.Content, "untaint")
+}
+
+func TestRenderActionPickerView_SelectAllTitle(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewActionPicker
+	m.selectAll = true
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "ALL resources selected")
+	assert.NotContains(t, view.Content, "resource(s) selected")
+}
+
+func TestRenderActionPickerView_SelectAllDimsTaintUntaint(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewActionPicker
+	m.selectAll = true
+
+	view := m.View()
+
+	for line := range strings.SplitSeq(view.Content, "\n") {
+		if strings.Contains(line, "taint") {
+			assert.Contains(t, line, dimAnsiString)
+		}
+	}
+}
+
+func TestRenderConfirmView_ShowsResourcesAndButtons(t *testing.T) {
+	m := newTestModel()
+	m.selected = map[string]bool{testResources[0].Address: true, testResources[2].Address: true}
+	m.viewState = viewConfirm
+	m.actionCursor = 1
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "apply 2 resource(s)?")
+	assert.Contains(t, view.Content, testResources[0].Address)
+	assert.Contains(t, view.Content, testResources[2].Address)
+	assert.Contains(t, view.Content, "Cancel")
+	assert.Contains(t, view.Content, "Confirm")
+}
+
+func TestRenderConfirmView_TruncatesLongSelections(t *testing.T) {
+	m := newTestModelEmpty()
+	m.viewState = viewConfirm
+
+	for i := range 15 {
+		addr := fmt.Sprintf("aws_s3_bucket.b_%02d", i)
+		m.resources[addr] = &terraform.Resource{
+			Address: addr, Action: terraform.ActionDelete,
+		}
+		m.selected[addr] = true
+	}
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "... and 5 more")
+	assert.Contains(t, view.Content, "aws_s3_bucket.b_00")
+	assert.Contains(t, view.Content, "aws_s3_bucket.b_09")
+	assert.NotContains(t, view.Content, "aws_s3_bucket.b_10")
+}
+
+func TestRenderConfirmView_SelectAllTitle(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewConfirm
+	m.selectAll = true
+	m.actionCursor = 1 // apply
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "ALL resource(s)?")
+	assert.NotContains(t, view.Content, "apply 0 resource(s)?")
+}
+
+func TestRenderProgressView_ShowsContent(t *testing.T) {
+	m := newActionTestModel()
+	m.actionCursor = 1 // apply
+	m.selected = map[string]bool{"aws_s3_bucket.a": true, "aws_s3_bucket.b": true}
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "Resource")
+	assert.Contains(t, view.Content, "Status")
+	assert.Contains(t, view.Content, "Wait")
+	assert.Contains(t, view.Content, "Read")
+	assert.Contains(t, view.Content, "Process")
+
+	assert.Contains(t, view.Content, "aws_s3_bucket.a")
+	assert.Contains(t, view.Content, "aws_s3_bucket.b")
+
+	assert.Contains(t, view.Content, "Running...")
+
+	m.workState = workIdle
+	view = m.View()
+	assert.NotContains(t, view.Content, "Running...")
+}
+
+func TestRenderProgressView_DifferentResourceStates(t *testing.T) {
+	tests := []struct {
+		status   string
+		progress Progress
+	}{
+		{status: "Pending", progress: Progress{}},
+		{status: "Complete", progress: Progress{Status: progressStatusSuccessful, ProcessStartedAt: time.Now().Add(-3 * time.Second), ProcessCompletedAt: time.Now()}},
+		{status: "Failed", progress: Progress{Status: progressStatusFailed}},
+		{status: "No change", progress: Progress{Status: progressStatusSkipped}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			m := newActionTestModel()
+			m.selected = map[string]bool{"aws_s3_bucket.a": true}
+			m.progresses["aws_s3_bucket.a"] = &tt.progress
+			m.progressRows[0] = &tt.progress
+
+			view := m.View()
+
+			assert.Contains(t, view.Content, tt.status)
+		})
+	}
+}
+
+func TestRenderProgressView_TruncatesLongAddress(t *testing.T) {
+	longAddr := "module.very_long_module_name.module.another_long_name.aws_s3_bucket.extremely_long_bucket_name_that_exceeds_width"
+	m := newTestModelWithResources([]*terraform.Resource{
+		{Address: longAddr},
+	})
+	m.viewWidth = 60
+	m.selected = map[string]bool{longAddr: true}
+	m.progresses = map[string]*Progress{
+		longAddr: {Address: longAddr, Status: progressStatusPending},
+	}
+
+	view := m.View()
+
+	assert.NotContains(t, view.Content, longAddr)
+	assert.Contains(t, view.Content, "…")
+}
+
+func TestRenderProgressView_Cursor(t *testing.T) {
+	m := newActionTestModel()
+	m.viewHeight = m.getReservedRows() + 1
+	m.cursor = 1
+	m.offset = 1
+	selectedAddr := m.progressRows[1].Address
+
+	view := m.View()
+
+	var selectedLine string
+	for line := range strings.SplitSeq(view.Content, "\n") {
+		if strings.Contains(line, selectedAddr) {
+			selectedLine = line
+		}
+	}
+
+	require.NotEmpty(t, selectedLine)
+	assert.Contains(t, selectedLine, cursorAnsiString)
+}
+
+func TestRenderOutputLayer_ShowsContent(t *testing.T) {
+	m := newTestModelEmpty()
+	m.viewState = viewOutput
+	m.actionCursor = 1
+	m.workState = workAction
+	m.outputLines = []string{
+		"aws_s3_bucket.uploads: Modifying...",
+		"aws_s3_bucket.uploads: Modifications complete after 2s",
+		"Apply complete! Resources: 0 added, 1 changed, 0 destroyed.",
+	}
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "aws_s3_bucket.uploads: Modifying...")
+	assert.Contains(t, view.Content, "Apply complete!")
+}
+
+func TestRenderOutputLayer_ShowsResourceOutputOnly(t *testing.T) {
+	m := newActionTestModel()
+	m.viewState = viewResourceOutput
+	m.cursor = 0
+	selected := m.progressRows[m.cursor]
+	selected.OutputLines = []string{"selected resource output"}
+	m.outputLines = []string{"full output"}
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, selected.Address)
+	assert.Contains(t, view.Content, "selected resource output")
+	assert.NotContains(t, view.Content, "full output")
+	assert.Contains(t, view.Content, "Enter")
+}
+
+func TestRenderOutputLayer_ShowsEmptyResourceOutputMessage(t *testing.T) {
+	m := newActionTestModel()
+	m.viewState = viewResourceOutput
+	m.cursor = 0
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "No output available yet.")
+}
+
+func TestRenderShutdownLayer_ShowsWaitingMessage(t *testing.T) {
+	m := newTestModel()
+	m.quitState = quittingState
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "Waiting for terraform to finish...")
+	assert.NotContains(t, view.Content, "Press q or ctrl+c again to force quit")
+}
+
+func TestRenderShutdownLayer_ShowsForceQuitAfterTimeout(t *testing.T) {
+	m := newTestModel()
+	m.quitState = forceQuitReadyState
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "Waiting for terraform to finish...")
+	assert.Contains(t, view.Content, "Press q or ctrl+c again to force quit")
+}
+
+func TestRenderErrorView_ShowsDiagnosticsAndError(t *testing.T) {
+	m := newTestModelEmpty()
+	m.viewState = viewError
+	m.diagnostics = []terraform.Diagnostic{
+		{Severity: "error", Summary: "Invalid reference", Detail: "Resource not declared"},
+		{Severity: "warning", Summary: "Deprecated attribute"},
+	}
+	m.err = fmt.Errorf("failed to start terraform")
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "Scanning Failed")
+	assert.Contains(t, view.Content, "Invalid reference")
+	assert.Contains(t, view.Content, "Resource not declared")
+	assert.Contains(t, view.Content, "Deprecated attribute")
+	assert.Contains(t, view.Content, "failed to start terraform")
+	assert.Contains(t, view.Content, "Esc")
+}
+
+func TestRenderDetailView_NoAttributes(t *testing.T) {
+	r := terraform.Resource{Attributes: nil}
+	m := newTestModelWithResources([]*terraform.Resource{&r})
+	m.openDetail()
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, "No details available")
+}
+
+func TestRenderDetailView_ShowsAddressAndJSON(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewDetail
+	m.outputLines = []string{"{", `  "id": "x"`, "}"}
+
+	view := m.View()
+
+	assert.Contains(t, view.Content, fmt.Sprintf("Detail (%s)", testResources[0].Address))
+	assert.Contains(t, view.Content, `"id": "x"`)
+}

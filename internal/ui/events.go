@@ -1,0 +1,188 @@
+package ui
+
+import (
+	"context"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/SayYoungMan/tfui/pkg/terraform"
+)
+
+type statePulledMsg struct {
+	resources []terraform.Resource
+	err       error
+}
+
+func (m *Model) waitForState() tea.Cmd {
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel.fn = cancel
+
+	return func() tea.Msg {
+		resources, err := m.runner.StatePull(ctx)
+		return statePulledMsg{resources: resources, err: err}
+	}
+}
+
+func (m Model) handleStatePulled(msg statePulledMsg) (Model, tea.Cmd) {
+	if msg.err != nil {
+		// If the error is due to trying to quit in the middle, just quit
+		if m.quitState == quittingState || m.quitState == forceQuitReadyState {
+			return m, tea.Quit
+		}
+		m.err = msg.err
+		m.workState = workIdle
+		m.viewState = viewError
+		return m, nil
+	}
+
+	for i, r := range msg.resources {
+		m.resources[r.Address] = &msg.resources[i]
+	}
+	m.rebuildRows()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel.fn = cancel
+	m.workState = workPlan
+
+	ch := m.runner.PlanAll(ctx)
+	m.eventCh = ch
+	return m, waitForEvent(ch)
+}
+
+type (
+	streamEventMsg      terraform.StreamEvent
+	streamCompleteMsg   struct{}
+	planChangesReadyMsg struct {
+		changes map[string]terraform.PlannedChange
+		err     error
+	}
+)
+
+func waitForEvent(ch <-chan terraform.StreamEvent) tea.Cmd {
+	return func() tea.Msg {
+		event, ok := <-ch
+		if !ok {
+			return streamCompleteMsg{}
+		}
+		return streamEventMsg(event)
+	}
+}
+
+func (m Model) handleStreamEvent(event terraform.StreamEvent) (tea.Model, tea.Cmd) {
+	if m.workState == workAction {
+		return m.handleActionEvent(event)
+	}
+
+	if event.Error != nil {
+		m.err = event.Error
+		return m, waitForEvent(m.eventCh)
+	}
+
+	if event.Diagnostic != nil {
+		m.diagnostics = append(m.diagnostics, *event.Diagnostic)
+		return m, waitForEvent(m.eventCh)
+	}
+
+	if event.Resource != nil {
+		addr := event.Resource.Address
+		// Preserve attributes because they will be replaced by new resource pointers from plan action
+		if existing, exists := m.resources[addr]; exists {
+			event.Resource.Attributes = existing.Attributes
+		}
+		m.resources[addr] = event.Resource
+
+		m.rebuildRows()
+	}
+
+	m.adjustOffset()
+	return m, waitForEvent(m.eventCh)
+}
+
+func waitForPlanChanges(ctx context.Context, runner *terraform.TerraformRunner) tea.Cmd {
+	return func() tea.Msg {
+		changes, err := runner.PlannedChanges(ctx)
+		return planChangesReadyMsg{
+			changes: changes,
+			err:     err,
+		}
+	}
+}
+
+func (m Model) handleActionEvent(event terraform.StreamEvent) (tea.Model, tea.Cmd) {
+	if event.Message != "" {
+		m.outputLines = append(m.outputLines, event.Message)
+
+		// add output to progress for per resource output view
+		if event.Resource != nil {
+			if p, ok := m.progresses[event.Resource.Address]; ok {
+				p.OutputLines = append(p.OutputLines, event.Message)
+			}
+		}
+	}
+
+	if event.Resource == nil {
+		return m, waitForEvent(m.eventCh)
+	}
+
+	ar, ok := m.progresses[event.Resource.Address]
+	if !ok {
+		// There are some apply_start and apply_complete from data sources that are not selected
+		return m, waitForEvent(m.eventCh)
+	}
+
+	currentAction := actionChoices[m.actionCursor]
+	switch event.Type {
+	case terraform.MsgTypeRefreshStart:
+		ar.Status = progressStatusReadingState
+		ar.ReadStartedAt = time.Now()
+	case terraform.MsgTypeRefreshComplete:
+		if currentAction == "plan" {
+			ar.Status = progressStatusSuccessful
+		} else {
+			ar.Status = progressStatusWaitingForAction
+		}
+		ar.ReadCompletedAt = time.Now()
+	case terraform.MsgTypeApplyStart:
+		ar.Status = progressStatusInProgress
+		ar.ProcessStartedAt = time.Now()
+	case terraform.MsgTypeApplyComplete:
+		ar.Status = progressStatusSuccessful
+		ar.ProcessCompletedAt = time.Now()
+	case terraform.MsgTypeApplyErrored:
+		ar.Status = progressStatusFailed
+		ar.ProcessCompletedAt = time.Now()
+	}
+
+	return m, waitForEvent(m.eventCh)
+}
+
+type (
+	outputLineMsg     string
+	outputCompleteMsg struct{}
+)
+
+func waitForOutput(ch <-chan string) tea.Cmd {
+	return func() tea.Msg {
+		line, ok := <-ch
+		if !ok {
+			return outputCompleteMsg{}
+		}
+		return outputLineMsg(line)
+	}
+}
+
+type forceQuitReadyMsg struct{}
+
+func waitForForceQuit() tea.Cmd {
+	return tea.Tick(10*time.Second, func(t time.Time) tea.Msg {
+		return forceQuitReadyMsg{}
+	})
+}
+
+type actionTickMsg time.Time
+
+func tickEverySecond() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return actionTickMsg(t)
+	})
+}

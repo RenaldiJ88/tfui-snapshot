@@ -1,0 +1,331 @@
+package ui
+
+import (
+	"context"
+	"time"
+
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/SayYoungMan/tfui/pkg/terraform"
+)
+
+type Model struct {
+	runner *terraform.TerraformRunner
+	styles styles
+
+	viewState  viewState
+	viewHeight int
+	viewWidth  int
+	eventCh    <-chan terraform.StreamEvent
+
+	cancel    *cancelWrapper
+	quitState quitState
+
+	resources       map[string]*terraform.Resource
+	progresses      map[string]*Progress
+	progressRows    []*Progress // ordered slice of progress in which they are rendered
+	actionStartTime time.Time
+
+	rootItem  *Item
+	rows      []Row
+	collapsed map[string]bool
+	selected  map[string]bool
+	selectAll bool
+	cursor    int // indicates which resource idx we are pointing at
+	offset    int // indicates which resource is shown at the top
+
+	filterInput   textinput.Model
+	hideUnchanged bool
+
+	workState   workState
+	spinner     spinner.Model
+	err         error
+	diagnostics []terraform.Diagnostic
+
+	actionCursor  int
+	confirmCursor int
+
+	outputLines []string
+	outputCh    <-chan string
+}
+
+// We wrap cancel function by struct so that we can move around the pointer to this wrapper around copies
+// This is needed because we don't want to have context as a field but Bubble tea uses methods with value receiver
+type cancelWrapper struct{ fn func() }
+
+var actionChoices []string = []string{"plan", "apply", "destroy", "taint", "untaint"}
+
+type viewState int
+
+const (
+	viewList viewState = iota
+	viewFilter
+	viewActionPicker
+	viewConfirm
+	viewProgress
+	viewOutput
+	viewResourceOutput
+	viewError
+	viewDetail
+	viewDiff
+)
+
+type workState int
+
+const (
+	workIdle      workState = iota // Not doing any terraform work
+	workStatePull                  // doing `terraform state pull` for inital population of resources
+	workPlan                       // doing `terraform plan` to scan resource states
+	workShowPlan                   // doing `terraform show planfile` to get diffs
+	workAction                     // doing action chosen by user
+)
+
+type quitState int
+
+const (
+	noneQuitState quitState = iota
+	confirmQuitState
+	quittingState
+	forceQuitReadyState
+)
+
+func NewModel(runner *terraform.TerraformRunner) Model {
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+
+	return Model{
+		runner:      runner,
+		styles:      newStyles(true),
+		resources:   make(map[string]*terraform.Resource),
+		collapsed:   make(map[string]bool),
+		selected:    make(map[string]bool),
+		rootItem:    &Item{Module: &Module{Address: ""}},
+		filterInput: newFilterInput(),
+		workState:   workStatePull,
+		cancel:      &cancelWrapper{},
+		spinner:     s,
+	}
+}
+
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(
+		tea.RequestBackgroundColor,
+		m.spinner.Tick,
+		m.waitForState(),
+	)
+}
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.viewHeight = msg.Height
+		m.viewWidth = msg.Width
+		m.filterInput.SetWidth(msg.Width - 7)
+		return m, nil
+
+	case tea.KeyPressMsg:
+		if msg.String() == "ctrl+c" || msg.String() == "q" {
+			if m.quitState == forceQuitReadyState {
+				return m, tea.Quit
+			}
+			if m.quitState == noneQuitState {
+				m.quitState = confirmQuitState
+			}
+			return m, nil
+		}
+		if m.quitState == confirmQuitState {
+			return m.quitConfirmKeys(msg)
+		}
+		// ignore input if it's quitting
+		if m.quitState == quittingState {
+			return m, nil
+		}
+
+		switch m.viewState {
+		case viewFilter:
+			return m.filterKeys(msg)
+		case viewActionPicker:
+			return m.actionPickerKeys(msg)
+		case viewConfirm:
+			return m.confirmKeys(msg)
+		case viewProgress:
+			return m.progressKeys(msg)
+		case viewOutput, viewResourceOutput:
+			return m.outputKeys(msg)
+		case viewError:
+			return m.errorKeys(msg)
+		case viewDetail:
+			return m.detailKeys(msg)
+		case viewDiff:
+			return m.diffKeys(msg)
+		default:
+			return m.listKeys(msg)
+		}
+
+	case tea.MouseWheelMsg:
+		switch m.viewState {
+		case viewOutput, viewDetail, viewDiff:
+			if msg.Button == tea.MouseWheelUp && m.offset > 0 {
+				m.offset--
+			} else if msg.Button == tea.MouseWheelDown {
+				if m.offset < len(m.outputLines)-1 {
+					m.offset++
+				}
+			}
+		case viewResourceOutput:
+			if msg.Button == tea.MouseWheelUp && m.offset > 0 {
+				m.offset--
+			} else if msg.Button == tea.MouseWheelDown {
+				if m.offset < len(m.progressRows[m.cursor].OutputLines)-1 {
+					m.offset++
+				}
+			}
+		case viewProgress:
+			if msg.Button == tea.MouseWheelUp && m.cursor > 0 {
+				m.cursor--
+				m.adjustOffset()
+			} else if msg.Button == tea.MouseWheelDown {
+				if m.cursor < len(m.progresses)-1 {
+					m.cursor++
+					m.adjustOffset()
+				}
+			}
+		case viewList:
+			if msg.Button == tea.MouseWheelUp && m.cursor > 0 {
+				m.cursor--
+				m.adjustOffset()
+			} else if msg.Button == tea.MouseWheelDown && m.cursor < len(m.rows)-1 {
+				m.cursor++
+				m.adjustOffset()
+			}
+		}
+		return m, nil
+
+	case statePulledMsg:
+		return m.handleStatePulled(msg)
+
+	case streamEventMsg:
+		return m.handleStreamEvent(terraform.StreamEvent(msg))
+
+	case streamCompleteMsg:
+		// If some resources are still pending that means they have no change
+		for _, ar := range m.progresses {
+			if ar.Status == progressStatusPending {
+				ar.Status = progressStatusSkipped
+			}
+		}
+
+		if m.quitState == quittingState || m.quitState == forceQuitReadyState {
+			return m, tea.Quit
+		}
+		if m.hasError() {
+			m.workState = workIdle
+			m.viewState = viewError
+		}
+
+		if m.workState == workPlan {
+			ctx, cancel := context.WithCancel(context.Background())
+			m.cancel.fn = cancel
+			m.workState = workShowPlan
+			return m, waitForPlanChanges(ctx, m.runner)
+		}
+
+		m.workState = workIdle
+		return m, nil
+
+	case planChangesReadyMsg:
+		m.workState = workIdle
+
+		if m.quitState == quittingState || m.quitState == forceQuitReadyState {
+			return m, tea.Quit
+		}
+
+		if msg.err != nil {
+			m.diagnostics = append(m.diagnostics, terraform.Diagnostic{
+				Severity: "warning",
+				Summary:  "failed to fetch diffs",
+				Detail:   msg.err.Error(),
+			})
+		}
+
+		for addr, change := range msg.changes {
+			if r, ok := m.resources[addr]; ok {
+				plannedChange := change
+				r.PlannedChange = &plannedChange
+			}
+		}
+		return m, nil
+
+	case outputLineMsg:
+		m.outputLines = append(m.outputLines, string(msg))
+		visible := m.viewHeight - m.getReservedRows()
+		if len(m.outputLines)-m.offset > visible {
+			m.offset = len(m.outputLines) - visible
+		}
+		return m, waitForOutput(m.outputCh)
+
+	case outputCompleteMsg:
+		m.workState = workIdle
+		if m.quitState == quittingState || m.quitState == forceQuitReadyState {
+			return m, tea.Quit
+		}
+		return m, nil
+
+	case forceQuitReadyMsg:
+		m.quitState = forceQuitReadyState
+		return m, nil
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+
+	case actionTickMsg:
+		if m.workState == workAction {
+			return m, tickEverySecond()
+		}
+
+	case tea.BackgroundColorMsg:
+		m.styles = newStyles(msg.IsDark())
+		return m, nil
+	}
+
+	return m, nil
+}
+
+func (m Model) View() tea.View {
+	var viewString string
+	switch m.viewState {
+	case viewActionPicker:
+		viewString = m.renderActionPickerView()
+	case viewConfirm:
+		viewString = m.renderConfirmView()
+	case viewProgress:
+		viewString = m.renderProgressView()
+	case viewOutput, viewResourceOutput:
+		viewString = m.renderOutputView()
+	case viewError:
+		viewString = m.renderErrorView()
+	case viewDetail:
+		viewString = m.renderDetailView()
+	case viewDiff:
+		viewString = m.renderDiffView()
+	default:
+		viewString = m.renderListView()
+	}
+
+	switch m.quitState {
+	case confirmQuitState:
+		viewString = lipgloss.NewCompositor(lipgloss.NewLayer(m.styles.dim.Render(viewString)), m.renderQuitConfirmLayer()).Render()
+	case quittingState, forceQuitReadyState:
+		viewString = lipgloss.NewCompositor(lipgloss.NewLayer(m.styles.dim.Render(viewString)), m.renderShutdownLayer()).Render()
+	}
+
+	v := tea.NewView(viewString)
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
+
+	return v
+}

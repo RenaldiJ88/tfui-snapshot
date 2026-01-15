@@ -1,0 +1,947 @@
+package ui
+
+import (
+	"fmt"
+	"testing"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/SayYoungMan/tfui/pkg/terraform"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestListKeys_Quit(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyPressMsg
+	}{
+		{"q key", tea.KeyPressMsg{Code: 'q'}},
+		{"ctrl+c", tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newTestModelEmpty()
+
+			newModel, _ := m.Update(tt.msg)
+			m = newModel.(Model)
+			assert.Equal(t, confirmQuitState, m.quitState)
+		})
+	}
+}
+
+func TestListKeys_CursorNavigation(t *testing.T) {
+	resources := []*terraform.Resource{
+		{Address: "aws_s3_bucket.a", Action: terraform.ActionNoop},
+		{Address: "aws_s3_bucket.b", Action: terraform.ActionNoop},
+		{Address: "aws_s3_bucket.c", Action: terraform.ActionNoop},
+	}
+	m := newTestModelWithResources(resources)
+
+	assert.Equal(t, 0, m.cursor)
+
+	// j moves down
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'j'})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.cursor)
+
+	// down arrow moves down
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = newModel.(Model)
+	assert.Equal(t, 2, m.cursor)
+
+	// Clamps at bottom
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'j'})
+	m = newModel.(Model)
+	assert.Equal(t, 2, m.cursor)
+
+	// k moves up
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'k'})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.cursor)
+
+	// up arrow moves up
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.cursor)
+
+	// Clamps at top
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'k'})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.cursor)
+}
+
+func TestListKeys_ScrollsUpWithCursor(t *testing.T) {
+	m := newTestModelEmpty()
+	m.viewHeight = 3 + m.getReservedRows()
+
+	for i := range 10 {
+		addr := fmt.Sprintf("aws_s3_bucket.bucket_%d", i)
+		m.resources[addr] = &terraform.Resource{
+			Address: addr,
+			Action:  terraform.ActionNoop,
+		}
+		m.rebuildRows()
+	}
+
+	m.cursor = 5
+	m.offset = 3
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'k'})
+	m = newModel.(Model)
+	assert.Equal(t, 4, m.cursor)
+	assert.Equal(t, 3, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'k'})
+	m = newModel.(Model)
+	assert.Equal(t, 3, m.cursor)
+	assert.Equal(t, 3, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'k'})
+	m = newModel.(Model)
+	assert.Equal(t, 2, m.cursor)
+	assert.Equal(t, 2, m.offset) // offset changes -> it scrolled up
+}
+
+func TestListKeys_PageNavigation(t *testing.T) {
+	m := newTestModelEmpty()
+	m.viewHeight = m.getReservedRows() + 3
+
+	for i := range 10 {
+		addr := fmt.Sprintf("aws_s3_bucket.bucket_%d", i)
+		m.resources[addr] = &terraform.Resource{
+			Address: addr,
+			Action:  terraform.ActionNoop,
+		}
+		m.rebuildRows()
+	}
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'd', Mod: tea.ModCtrl})
+	m = newModel.(Model)
+	assert.Equal(t, 3, m.cursor)
+	assert.Equal(t, 3, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	m = newModel.(Model)
+	assert.Equal(t, 6, m.cursor)
+	assert.Equal(t, 6, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	m = newModel.(Model)
+	assert.Equal(t, 9, m.cursor)
+	assert.Equal(t, 7, m.offset)
+
+	m.cursor = 6
+	m.offset = 6
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'u', Mod: tea.ModCtrl})
+	m = newModel.(Model)
+	assert.Equal(t, 3, m.cursor)
+	assert.Equal(t, 3, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.cursor)
+	assert.Equal(t, 0, m.offset)
+}
+
+func TestListKeys_ToggleHideUnchanged(t *testing.T) {
+	m := newTestModel()
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'H'})
+	m = newModel.(Model)
+	assert.True(t, m.hideUnchanged)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'H'})
+	m = newModel.(Model)
+	assert.False(t, m.hideUnchanged)
+}
+
+func TestListKeys_ToggleHideUnchangedWorksEvenWhenRowsEmpty(t *testing.T) {
+	m := newTestModelEmpty()
+	require.Empty(t, m.rows)
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'H'})
+	m = newModel.(Model)
+	assert.True(t, m.hideUnchanged)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'H'})
+	m = newModel.(Model)
+	assert.False(t, m.hideUnchanged)
+}
+
+func TestListKeys_ToggleSelect(t *testing.T) {
+	m := newTestModel()
+
+	// Select first resource
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeySpace})
+	m = newModel.(Model)
+	assert.True(t, m.selected[testResources[0].Address])
+
+	// Deselect it
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeySpace})
+	m = newModel.(Model)
+	assert.False(t, m.selected[testResources[0].Address])
+}
+
+func TestListKeys_SelectEmptyList(t *testing.T) {
+	m := newTestModelEmpty()
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeySpace})
+	m = newModel.(Model)
+
+	assert.Empty(t, m.selected)
+}
+
+func TestListKeys_SelectTurnsOffSelectAll(t *testing.T) {
+	m := newTestModel()
+	m.selectAll = true
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeySpace})
+	m = newModel.(Model)
+
+	assert.False(t, m.selectAll)
+	assert.NotEmpty(t, m.selected)
+}
+
+func TestListKeys_RemoveSelectionIfParentSelected(t *testing.T) {
+	resources := []*terraform.Resource{
+		{Address: "module.a.aws_s3.x", Module: "module.a", Action: terraform.ActionCreate},
+	}
+	m := newTestModelWithResources(resources)
+	m.selected["module.a.aws_s3.x"] = true
+
+	// Cursor is already on module m.cursor = 0
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeySpace})
+	m = newModel.(Model)
+
+	assert.Contains(t, m.selected, "module.a")
+	assert.NotContains(t, m.selected, "module.a.aws_s3.x")
+
+	m.cursor = 1
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeySpace})
+	m = newModel.(Model)
+
+	// Ignore child selection if parent selected
+	assert.Contains(t, m.selected, "module.a")
+	assert.NotContains(t, m.selected, "module.a.aws_s3.x")
+}
+
+func TestListKeys_ActionBlockedWhileScanning(t *testing.T) {
+	m := newTestModel()
+	m.workState = workPlan
+	m.selected = map[string]bool{testResources[0].Address: true}
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = newModel.(Model)
+
+	assert.Equal(t, viewList, m.viewState)
+}
+
+func TestListKeys_ActionOnCursorIfNoSelection(t *testing.T) {
+	m := newTestModel()
+	m.workState = workIdle
+	m.cursor = 2
+
+	require.Empty(t, m.selected)
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = newModel.(Model)
+
+	assert.Equal(t, viewActionPicker, m.viewState)
+	assert.Equal(t, 0, m.actionCursor)
+	assert.Len(t, m.selected, 1)
+	assert.True(t, m.selected["aws_s3_bucket.a"])
+}
+
+func TestListKeys_NoActionOnCursorIfSelectAll(t *testing.T) {
+	m := newTestModel()
+	m.selectAll = true
+	m.workState = workIdle
+	m.cursor = 2
+
+	require.Empty(t, m.selected)
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = newModel.(Model)
+
+	assert.Empty(t, m.selected)
+	assert.Equal(t, viewActionPicker, m.viewState)
+}
+
+func TestListKeys_RefreshRescan(t *testing.T) {
+	m := newTestModel()
+	m.workState = workIdle
+	m.runner = terraform.NewTerraformRunner(t.TempDir(), "true")
+
+	newModel, cmd := m.Update(tea.KeyPressMsg{Code: 'r', Mod: tea.ModCtrl})
+	m = newModel.(Model)
+
+	assert.True(t, m.isRunning())
+	assert.Equal(t, viewList, m.viewState)
+	assert.Empty(t, m.selected)
+	assert.NotNil(t, cmd)
+}
+
+func TestListKeys_RefreshBlockedWhileScanning(t *testing.T) {
+	m := newTestModel()
+	m.workState = workPlan
+
+	newModel, cmd := m.Update(tea.KeyPressMsg{Code: 'r', Mod: tea.ModCtrl})
+	m = newModel.(Model)
+
+	assert.Nil(t, cmd)
+}
+
+func TestListKeys_TabOpensActionPicker(t *testing.T) {
+	m := newTestModel()
+	m.workState = workIdle
+	m.selected = map[string]bool{testResources[0].Address: true}
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = newModel.(Model)
+
+	assert.Equal(t, viewActionPicker, m.viewState)
+	assert.Equal(t, 0, m.actionCursor)
+}
+
+func TestListKeys_ModuleExpandCollapse(t *testing.T) {
+	resources := []*terraform.Resource{
+		{Address: "module.a.aws_s3.x", Module: "module.a", Action: terraform.ActionCreate},
+	}
+	m := newTestModelWithResources(resources)
+
+	require.Empty(t, m.collapsed)
+
+	// The cursor on resource not module
+	m.cursor = 1
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'h'})
+	m = newModel.(Model)
+	require.Len(t, m.collapsed, 1)
+	require.Equal(t, 0, m.cursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'l'})
+	m = newModel.(Model)
+	require.Len(t, m.collapsed, 0)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
+	m = newModel.(Model)
+	require.Len(t, m.collapsed, 1)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	m = newModel.(Model)
+	require.Len(t, m.collapsed, 0)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = newModel.(Model)
+	require.Len(t, m.collapsed, 1)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = newModel.(Model)
+	require.Len(t, m.collapsed, 0)
+}
+
+func TestListKeys_EnterResourceDetail(t *testing.T) {
+	m := newTestModel()
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = newModel.(Model)
+
+	assert.Equal(t, viewDetail, m.viewState)
+}
+
+func TestListKeys_CtrlASelectAll(t *testing.T) {
+	m := newTestModel()
+	m.selected = map[string]bool{"a": true}
+	require.False(t, m.selectAll)
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'a', Mod: tea.ModCtrl})
+	m = newModel.(Model)
+	assert.True(t, m.selectAll)
+	assert.Empty(t, m.selected)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'a', Mod: tea.ModCtrl})
+	m = newModel.(Model)
+	assert.False(t, m.selectAll)
+}
+
+func TestListKeys_DiffBlockedWhileRunning(t *testing.T) {
+	m := newTestModel()
+	m.workState = workShowPlan
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'd'})
+	m = newModel.(Model)
+
+	assert.Equal(t, viewList, m.viewState)
+}
+
+func TestFilterModeKeys_FilterFocusAndUnfocus(t *testing.T) {
+	m := newTestModel()
+
+	require.Equal(t, viewList, m.viewState)
+
+	newModel, cmd := m.Update(tea.KeyPressMsg{Code: '/'})
+	m = newModel.(Model)
+	require.Equal(t, viewFilter, m.viewState)
+	assert.NotNil(t, cmd)
+
+	m.filterInput.SetValue("s3")
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = newModel.(Model)
+	require.Equal(t, viewList, m.viewState)
+	assert.Equal(t, "s3", m.filterInput.Value())
+
+	newModel, cmd = m.Update(tea.KeyPressMsg{Code: '/'})
+	m = newModel.(Model)
+	require.Equal(t, viewFilter, m.viewState)
+	assert.NotNil(t, cmd)
+
+	m.filterInput.SetValue("s3")
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = newModel.(Model)
+	require.Equal(t, viewList, m.viewState)
+	assert.Equal(t, "s3", m.filterInput.Value())
+}
+
+func TestActionPickerKeys_Navigation(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewActionPicker
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'j'})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.actionCursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'k'})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.actionCursor)
+
+	// Clamp at top
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'k'})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.actionCursor)
+
+	// Clamp at bottom
+	for range len(actionChoices) {
+		newModel, _ = m.Update(tea.KeyPressMsg{Code: 'j'})
+		m = newModel.(Model)
+	}
+	assert.Equal(t, len(actionChoices)-1, m.actionCursor)
+}
+
+func TestActionPickerKeys_TabNext(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewActionPicker
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = newModel.(Model)
+	require.Equal(t, 1, m.actionCursor)
+
+	m.actionCursor = 4
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.actionCursor)
+}
+
+func TestActionPickerKeys_EscReturnsToList(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewActionPicker
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = newModel.(Model)
+
+	assert.Equal(t, viewList, m.viewState)
+}
+
+func TestActionPickerKeys_CursorResetsOnEntry(t *testing.T) {
+	m := newTestModel()
+	m.workState = workIdle
+	m.selected = map[string]bool{testResources[0].Address: true}
+	m.actionCursor = 3
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = newModel.(Model)
+
+	assert.Equal(t, 0, m.actionCursor)
+}
+
+func TestActionPickerKeys_EnterGoesConfirmView(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewActionPicker
+	m.actionCursor = 2
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = newModel.(Model)
+
+	assert.Equal(t, "destroy", actionChoices[m.actionCursor])
+	assert.Equal(t, 0, m.confirmCursor)
+	assert.Equal(t, viewConfirm, m.viewState)
+}
+
+func TestActionPickerKeys_NoEnterTaintIfSelectAll(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewActionPicker
+	m.selectAll = true
+
+	m.actionCursor = 3
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = newModel.(Model)
+
+	assert.Equal(t, "taint", actionChoices[m.actionCursor])
+	assert.Equal(t, viewActionPicker, m.viewState)
+
+	m.actionCursor = 4
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = newModel.(Model)
+
+	assert.Equal(t, "untaint", actionChoices[m.actionCursor])
+	assert.Equal(t, viewActionPicker, m.viewState)
+}
+
+func TestConfirmKeys_DefaultsToCancel(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewActionPicker
+	m.selected = map[string]bool{testResources[0].Address: true}
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = newModel.(Model)
+
+	assert.Equal(t, 0, m.confirmCursor)
+}
+
+func TestConfirmKeys_Navigation(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewConfirm
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'l'})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.confirmCursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.confirmCursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'h'})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.confirmCursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.confirmCursor)
+}
+
+func TestConfirmKeys_TabAlternate(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewConfirm
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = newModel.(Model)
+	require.Equal(t, 1, m.confirmCursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = newModel.(Model)
+	require.Equal(t, 0, m.confirmCursor)
+}
+
+func TestConfirmKeys_CancelToPicker(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewConfirm
+	m.confirmCursor = 0
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = newModel.(Model)
+	assert.Equal(t, viewActionPicker, m.viewState)
+}
+
+func TestConfirmKeys_ConfirmToOutput(t *testing.T) {
+	m := NewModel(terraform.NewTerraformRunner(t.TempDir(), "true"))
+	m.viewState = viewConfirm
+	m.confirmCursor = 1
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = newModel.(Model)
+	assert.Equal(t, viewProgress, m.viewState)
+}
+
+func TestConfirmKeys_EscToPicker(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewConfirm
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = newModel.(Model)
+	assert.Equal(t, viewActionPicker, m.viewState)
+}
+
+func TestQuitConfirmKeys_Navigation(t *testing.T) {
+	m := newTestModel()
+	m.quitState = confirmQuitState
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'l'})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.confirmCursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.confirmCursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'h'})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.confirmCursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.confirmCursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = newModel.(Model)
+	require.Equal(t, 1, m.confirmCursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = newModel.(Model)
+	require.Equal(t, 0, m.confirmCursor)
+}
+
+func TestQuitConfirmKeys_Cancel(t *testing.T) {
+	tests := []struct {
+		name string
+		key  tea.KeyPressMsg
+	}{
+		{name: "cancel enter", key: tea.KeyPressMsg{Code: tea.KeyEnter}},
+		{name: "esc", key: tea.KeyPressMsg{Code: tea.KeyEsc}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newTestModel()
+			m.quitState = confirmQuitState
+			m.confirmCursor = 0
+
+			require.Contains(t, m.View().Content, quitConfirmTitle)
+
+			newModel, _ := m.Update(tt.key)
+			m = newModel.(Model)
+			assert.NotContains(t, m.View().Content, quitConfirmTitle)
+		})
+	}
+}
+
+func TestQuitConfirmKeys_Confirm(t *testing.T) {
+	m := newTestModel()
+	m.quitState = confirmQuitState
+	m.confirmCursor = 1
+
+	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	assert.NotNil(t, cmd)
+}
+
+func TestProgressKeys_Navigation(t *testing.T) {
+	m := newActionTestModel()
+	m.viewState = viewProgress
+	m.cursor = 0
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'j'})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.cursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.cursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'k'})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.cursor)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.cursor)
+}
+
+func TestProgressKeys_PageNavigation(t *testing.T) {
+	m := newActionTestModel()
+	m.viewHeight = m.getReservedRows() + 4
+	m.progressRows = nil
+	m.progresses = make(map[string]*Progress)
+	for i := range 10 {
+		addr := fmt.Sprintf("aws_s3_bucket.bucket_%d", i)
+		progress := &Progress{Address: addr, Status: progressStatusPending}
+		m.progressRows = append(m.progressRows, progress)
+		m.progresses[addr] = progress
+	}
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'd', Mod: tea.ModCtrl})
+	m = newModel.(Model)
+	assert.Equal(t, 4, m.cursor)
+	assert.Equal(t, 4, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	m = newModel.(Model)
+	assert.Equal(t, 8, m.cursor)
+	assert.Equal(t, 6, m.offset)
+
+	m.cursor = 8
+	m.offset = 6
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'u', Mod: tea.ModCtrl})
+	m = newModel.(Model)
+	assert.Equal(t, 4, m.cursor)
+	assert.Equal(t, 2, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.cursor)
+	assert.Equal(t, 0, m.offset)
+}
+
+func TestProgressKeys_oToOutput(t *testing.T) {
+	m := newActionTestModel()
+	m.viewState = viewProgress
+	m.offset = 1
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'o'})
+	m = newModel.(Model)
+
+	assert.Equal(t, viewOutput, m.viewState)
+	assert.Equal(t, 0, m.offset)
+}
+
+func TestProgressKeys_EnterToResourceOutput(t *testing.T) {
+	m := newActionTestModel()
+	m.viewState = viewProgress
+	m.offset = 1
+	m.cursor = 0
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = newModel.(Model)
+
+	assert.Equal(t, viewResourceOutput, m.viewState)
+	assert.Equal(t, 0, m.offset)
+}
+
+func TestProgressKeys_RescanWhenIdle(t *testing.T) {
+	m := newActionTestModel()
+	m.viewState = viewProgress
+	m.workState = workIdle
+	m.runner = terraform.NewTerraformRunner(t.TempDir(), "true")
+
+	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+
+	assert.NotNil(t, cmd)
+}
+
+func TestOutputKeys_ToProgress(t *testing.T) {
+	tests := []struct {
+		name string
+		key  rune
+	}{
+		{name: "Enter", key: tea.KeyEnter},
+		{name: "o", key: 'o'},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name+"/Output", func(t *testing.T) {
+			m := newTestModel()
+			m.viewState = viewOutput
+			m.workState = workAction
+
+			newModel, _ := m.Update(tea.KeyPressMsg{Code: tt.key})
+			m = newModel.(Model)
+
+			assert.Equal(t, viewProgress, m.viewState)
+		})
+		t.Run(tt.name+"/ResourceOutput", func(t *testing.T) {
+			m := newTestModel()
+			m.viewState = viewResourceOutput
+			m.workState = workAction
+
+			newModel, _ := m.Update(tea.KeyPressMsg{Code: tt.key})
+			m = newModel.(Model)
+
+			assert.Equal(t, viewProgress, m.viewState)
+		})
+	}
+}
+
+func TestOutputKeys_Navigation(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewOutput
+	m.viewHeight = m.getReservedRows() + 2 // 2 visible rows
+	m.outputLines = []string{"line 0", "line 1", "line 2", "line 3"}
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'j'})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = newModel.(Model)
+	assert.Equal(t, 2, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'k'})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.offset)
+}
+
+func TestOutputKeys_PageNavigation(t *testing.T) {
+	m := newTestModel()
+	m.viewState = viewOutput
+	m.viewHeight = m.getReservedRows() + 2
+	m.outputLines = []string{"line 0", "line 1", "line 2", "line 3", "line 4", "line 5"}
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'd', Mod: tea.ModCtrl})
+	m = newModel.(Model)
+	assert.Equal(t, 2, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	m = newModel.(Model)
+	assert.Equal(t, 4, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'u', Mod: tea.ModCtrl})
+	m = newModel.(Model)
+	assert.Equal(t, 2, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.offset)
+}
+
+func TestOutputKeys_PageNavigationResourceOutput(t *testing.T) {
+	m := newActionTestModel()
+	m.viewState = viewResourceOutput
+	m.viewHeight = m.getReservedRows() + 2
+	m.cursor = 0
+	m.progressRows[m.cursor].OutputLines = []string{"line 0", "line 1", "line 2", "line 3"}
+	m.outputLines = []string{"full output line 0"}
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	m = newModel.(Model)
+	assert.Equal(t, 2, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	m = newModel.(Model)
+	assert.Equal(t, 3, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.offset)
+}
+
+func TestErrorKeys_Quit(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyPressMsg
+	}{
+		{"enter", tea.KeyPressMsg{Code: tea.KeyEnter}},
+		{"esc", tea.KeyPressMsg{Code: tea.KeyEscape}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newTestModel()
+			m.viewState = viewError
+			cancelled := false
+			m.cancel.fn = func() { cancelled = true }
+
+			_, cmd := m.Update(tt.msg)
+
+			assert.True(t, cancelled)
+			assert.NotNil(t, cmd)
+		})
+	}
+}
+
+func TestDetailKeys_CloseDetail(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyPressMsg
+	}{
+		{"enter", tea.KeyPressMsg{Code: tea.KeyEnter}},
+		{"esc", tea.KeyPressMsg{Code: tea.KeyEscape}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newTestModel()
+			m.viewState = viewDetail
+			m.outputLines = []string{"test"}
+			m.offset = 3
+
+			newModel, _ := m.Update(tt.msg)
+			m = newModel.(Model)
+
+			assert.Equal(t, viewList, m.viewState)
+			assert.Empty(t, m.outputLines)
+			assert.Zero(t, m.offset)
+		})
+	}
+}
+
+func TestDetailKeys_Scroll(t *testing.T) {
+	m := newTestModelEmpty()
+	m.viewState = viewDetail
+	m.outputLines = []string{"a", "b", "c", "d"}
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'j'})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = newModel.(Model)
+	assert.Equal(t, 2, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	m = newModel.(Model)
+	assert.Equal(t, 1, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'k'})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.offset)
+}
+
+func TestDetailKeys_PageNavigation(t *testing.T) {
+	m := newTestModelEmpty()
+	m.viewState = viewDetail
+	m.viewHeight = m.getReservedRows() + 2
+	m.outputLines = []string{"a", "b", "c", "d", "e"}
+
+	newModel, _ := m.Update(tea.KeyPressMsg{Code: 'd', Mod: tea.ModCtrl})
+	m = newModel.(Model)
+	assert.Equal(t, 2, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	m = newModel.(Model)
+	assert.Equal(t, 4, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: 'u', Mod: tea.ModCtrl})
+	m = newModel.(Model)
+	assert.Equal(t, 2, m.offset)
+
+	newModel, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
+	m = newModel.(Model)
+	assert.Equal(t, 0, m.offset)
+}
+
+func TestDiffKeys_CloseWithDAndEsc(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyPressMsg
+	}{
+		{"d", tea.KeyPressMsg{Code: 'd'}},
+		{"esc", tea.KeyPressMsg{Code: tea.KeyEscape}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newTestModel()
+			m.viewState = viewDiff
+			m.outputLines = []string{"diff"}
+			m.offset = 2
+
+			newModel, _ := m.Update(tt.msg)
+			m = newModel.(Model)
+
+			assert.Equal(t, viewList, m.viewState)
+			assert.Empty(t, m.outputLines)
+			assert.Zero(t, m.offset)
+		})
+	}
+}
